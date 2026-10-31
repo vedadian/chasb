@@ -1,0 +1,49 @@
+{
+  "name": "chasb",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A unified TypeScript backend framework with cross-runtime support, including PHP.",
+  "keywords": [
+    "chasb",
+    "typescript",
+    "backend",
+    "framework",
+    "php",
+    "transpiler",
+    "cross-runtime",
+    "shared-hosting"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "entry": "src/index.ts",
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --noEmit",
+    "run": "tsx src/index.ts",
+    "lint": "eslint src",
+    "format": "prettier --write .",
+    "prepublishOnly": "pnpm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript-eslint": "^8.72.1"
+  },
+  "dependencies": {
+    "cac": "^7.1.0",
+    "typescript": "^6.0.3"
+  }
+}

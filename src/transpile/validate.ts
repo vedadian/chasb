@@ -1,80 +1,10 @@
 import path from "node:path";
 import ts from "typescript";
-
-export type ProjectDiagnostic = {
-  filePath: string;
-  line: number;
-  column: number;
-  message: string;
-};
-
-export const getProjectConfiguration = (projectPath: string) => {
-  const configPath = ts.findConfigFile(projectPath, ts.sys.fileExists);
-  if (!configPath)
-    return {
-      diagnostics: [
-        {
-          filePath: "<N/A>",
-          line: -1,
-          column: -1,
-          message: "No tsconfig.json found",
-        },
-      ] as ProjectDiagnostic[],
-    };
-
-  const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (configFile.error) {
-    return {
-      diagnostics: [
-        {
-          filePath: configPath,
-          line: configFile.error.start ?? -1,
-          column: configFile.error.start ?? -1,
-          message: ts.flattenDiagnosticMessageText(
-            configFile.error.messageText,
-            "\n",
-          ),
-        },
-      ],
-    };
-  }
-
-  const parsedConfig = ts.parseJsonConfigFileContent(
-    configFile.config,
-    ts.sys,
-    path.dirname(configPath),
-    undefined,
-    configPath,
-  );
-
-  const diagnostics: ProjectDiagnostic[] = [];
-
-  diagnostics.push(
-    ...parsedConfig.errors.map((error) => ({
-      filePath: path.relative(projectPath, error.file?.fileName ?? configPath),
-      line: error.start ?? -1,
-      column: -1,
-      message: ts.flattenDiagnosticMessageText(error.messageText, "\n"),
-    })),
-  );
-
-  return {
-    config: parsedConfig,
-    diagnostics,
-  };
-};
-
-export const getTypescriptProgram = (projectPath: string) => {
-  const { config, diagnostics } = getProjectConfiguration(projectPath);
-  if (!config) return { program: undefined, diagnostics };
-
-  const program = ts.createProgram({
-    rootNames: config.fileNames,
-    options: config.options,
-  });
-
-  return { program, diagnostics };
-};
+import type { ProjectDiagnostic } from "./helper.js";
+import {
+  findHttpRequestAndResponseImports,
+  getMainFunctions,
+} from "./project.js";
 
 export const validateSynaxAndSemantics = (program: ts.Program) => {
   const diagnostics: ProjectDiagnostic[] = [];
@@ -102,82 +32,6 @@ export const validateSynaxAndSemantics = (program: ts.Program) => {
   return diagnostics;
 };
 
-export const getMainFunctions = (program: ts.Program) => {
-  const mainFunctions: Map<ts.Symbol, readonly ts.Signature[]> = new Map();
-  const checker = program.getTypeChecker();
-  for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile) continue;
-    if (sourceFile.fileName.includes("node_modules")) continue;
-    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-    if (!moduleSymbol) continue;
-    const exports = checker.getExportsOfModule(moduleSymbol);
-    for (const exp of exports) {
-      if (exp.name === "main" && exp.valueDeclaration) {
-        const type = checker.getTypeOfSymbolAtLocation(
-          exp,
-          exp.valueDeclaration,
-        );
-        if (type.getCallSignatures().length > 0) {
-          mainFunctions.set(exp, type.getCallSignatures());
-        }
-      }
-    }
-  }
-  return mainFunctions;
-};
-
-export const findHttpRequestAndResponseImports = (program: ts.Program) => {
-  const imports: {
-    HttpRequest: ts.Type | undefined;
-    HttpResponse: ts.Type | undefined;
-  } = {
-    HttpRequest: undefined,
-    HttpResponse: undefined,
-  };
-  const checker = program.getTypeChecker();
-  for (const sourceFile of program.getSourceFiles()) {
-    if (sourceFile.isDeclarationFile) continue;
-    if (sourceFile.fileName.includes("node_modules")) continue;
-    ts.forEachChild(sourceFile, (node) => {
-      if (
-        ts.isImportDeclaration(node) &&
-        node.moduleSpecifier.getText().includes("'chasb/http'")
-      ) {
-        const importClause = node.importClause;
-        if (
-          importClause &&
-          importClause.namedBindings &&
-          ts.isNamedImports(importClause.namedBindings)
-        ) {
-          for (const element of importClause.namedBindings.elements) {
-            const symbol = checker.getSymbolAtLocation(element.name);
-            if (element.name.text === "HttpRequest")
-              imports.HttpRequest = symbol
-                ? checker.getTypeOfSymbolAtLocation(symbol, element.name)
-                : undefined;
-            if (element.name.text === "HttpResponse")
-              imports.HttpResponse = symbol
-                ? checker.getTypeOfSymbolAtLocation(symbol, element.name)
-                : undefined;
-          }
-        }
-      }
-    });
-  }
-  return imports;
-};
-
-export const getHttpRequestAndResponseSymbols = (checker: ts.TypeChecker) => {
-  const moduleSymbol = checker
-    .getAmbientModules()
-    .find((symbol) => symbol.getName().includes("'chasb/http'"));
-  if (!moduleSymbol) return { HttpRequest: undefined, HttpResponse: undefined };
-  const exports = checker.getExportsOfModule(moduleSymbol);
-  const HttpRequest = exports.find((exp) => exp.name === "HttpRequest");
-  const HttpResponse = exports.find((exp) => exp.name === "HttpResponse");
-  return { HttpRequest, HttpResponse };
-};
-
 export const checkParameterAndReturnTypeOfMain = (
   mainFunction: ts.Symbol,
   callSignatures: readonly ts.Signature[],
@@ -196,7 +50,7 @@ export const checkParameterAndReturnTypeOfMain = (
     );
   }
   const sourceFile = mainFunction.valueDeclaration.getSourceFile();
-  const targetSignatureDiagnostics = callSignatures.map((signature) => {
+  const targetSignatureDiagnostics = callSignatures.flatMap((signature) => {
     const diagnostics: ProjectDiagnostic[] = [];
     const isArgumentTypeProper = (() => {
       if (signature.parameters.length !== 1) return false;
@@ -230,9 +84,13 @@ export const checkParameterAndReturnTypeOfMain = (
       if (!returnType) return false;
       const awaitedReturnType =
         checker.getAwaitedType(returnType) ?? returnType;
-      if (!checker.isTypeAssignableTo(returnType, httpSymbols.HttpResponse))
+      if (
+        !checker.isTypeAssignableTo(awaitedReturnType, httpSymbols.HttpResponse)
+      )
         return false;
-      if (!checker.isTypeAssignableTo(httpSymbols.HttpResponse, returnType))
+      if (
+        !checker.isTypeAssignableTo(httpSymbols.HttpResponse, awaitedReturnType)
+      )
         return false;
       return true;
     })();
@@ -249,11 +107,12 @@ export const checkParameterAndReturnTypeOfMain = (
         column,
       });
     }
+    return diagnostics;
   });
   return targetSignatureDiagnostics;
 };
 
-export const validateImports = (
+export const validateModuleImports = (
   sourceFile: ts.SourceFile,
   checker: ts.TypeChecker,
   allowedImports: string[],
@@ -325,26 +184,75 @@ export const checkRequireAndImportNodes = (
   return diagnostics;
 };
 
-export const validateTypescriptProject = (project: ts.Program) => {
-  const diagnostics: ProjectDiagnostic[] = [];
+export const validateTypescriptProgram = (program: ts.Program) => {
+  const diagnostics: ProjectDiagnostic[] = [
+    ...validateSynaxAndSemantics(program),
+  ];
   const allowedImports = [
     "chasb/logging",
     "chasb/random",
     "chasb/config",
     "chasb/crypto",
     "chasb/http",
-    "chasb/time",
+    "chasb/jwt",
     "chasb/fs",
     "chasb/db",
   ];
-  const projectPath = project.getCurrentDirectory();
-  const checker = project.getTypeChecker();
-  for (const sourceFile of project.getSourceFiles()) {
+  const projectPath = program.getCurrentDirectory();
+  const checker = program.getTypeChecker();
+  for (const sourceFile of program.getSourceFiles()) {
     if (!sourceFile.isDeclarationFile) {
       diagnostics.push(
-        ...validateImports(sourceFile, checker, allowedImports, projectPath),
+        ...validateModuleImports(
+          sourceFile,
+          checker,
+          allowedImports,
+          projectPath,
+        ),
       );
       diagnostics.push(...checkRequireAndImportNodes(sourceFile, projectPath));
+    }
+  }
+
+  const mainFunctions = getMainFunctions(program);
+
+  if (mainFunctions.size !== 1) {
+    diagnostics.push({
+      message: `There must be exactly one 'main' function exported. ${
+        mainFunctions.size
+      } main functions were found (
+      ${[...mainFunctions.keys()]
+        .flatMap((sym) =>
+          sym
+            .getDeclarations()
+            ?.map((decl) =>
+              path.relative(projectPath, decl.getSourceFile().fileName),
+            ),
+        )
+        .join(", ")}).`,
+      filePath: "<N/A>",
+      line: -1,
+      column: -1,
+    });
+  } else {
+    const httpSymbols = findHttpRequestAndResponseImports(program);
+    if (!httpSymbols.HttpRequest || !httpSymbols.HttpResponse) {
+      diagnostics.push({
+        message: "Failed to find HTTP request and response imports.",
+        filePath: "<N/A>",
+        line: -1,
+        column: -1,
+      });
+    } else {
+      diagnostics.push(
+        ...checkParameterAndReturnTypeOfMain(
+          mainFunctions.keys().next().value!,
+          mainFunctions.values().next().value!,
+          checker,
+          httpSymbols as { HttpRequest: ts.Type; HttpResponse: ts.Type },
+          projectPath,
+        ),
+      );
     }
   }
   return diagnostics;

@@ -15,20 +15,39 @@
     "shared-hosting"
   ],
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs"
+    "./logging": {
+      "types": "./dist/modules/logging.d.ts",
+      "import": "./dist/modules/logging.js"
     },
-    "./package.json": "./package.json"
+    "./random": {
+      "types": "./dist/modules/random.d.ts",
+      "import": "./dist/modules/random.js"
+    },
+    "./config": {
+      "types": "./dist/modules/config.d.ts",
+      "import": "./dist/modules/config.js"
+    },
+    "./crypto": {
+      "types": "./dist/modules/crypto.d.ts",
+      "import": "./dist/modules/crypto.js"
+    },
+    "./jwt": {
+      "types": "./dist/modules/jwt.d.ts",
+      "import": "./dist/modules/jwt.js"
+    },
+    "./fs": {
+      "types": "./dist/modules/fs.d.ts",
+      "import": "./dist/modules/fs.js"
+    },
+    "./db": {
+      "types": "./dist/modules/db.d.ts",
+      "import": "./dist/modules/db.js"
+    }
   },
-  "files": [
-    "dist"
-  ],
-  "entry": "src/index.ts",
   "scripts": {
     "build": "tsc --build",
     "typecheck": "tsc --noEmit",
-    "run": "tsx src/index.ts",
+    "cli": "tsx src/transpile/cli.ts",
     "lint": "eslint src",
     "format": "prettier --write .",
     "prepublishOnly": "pnpm run build"

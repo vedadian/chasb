@@ -1,7 +1,10 @@
 import ts from "typescript";
 import {
+  getInternalTypeName,
+  getInternalTypePropertySpec,
   Indentation,
   isConstructible,
+  isNumber,
   isStringLike,
   prepareStringValue,
   prepareVariableName,
@@ -208,12 +211,90 @@ const compileFunctionNode = (
   }${generator ? "*" : ""}function ${name ?? ""}(${parameters.join(", ")}) ${useExpression}${bodyConsideringAsync}`;
 };
 
+const compileNewExpressionNode = (
+  node: ts.NewExpression,
+  checker: ts.TypeChecker,
+  scope: Map<ts.Symbol, string>,
+  indentation: Indentation,
+): string => {
+  const internalTypeName = (() => {
+    const constructorType = checker.getTypeAtLocation(node.expression);
+    const constructorSignatures = checker.getSignaturesOfType(
+      constructorType,
+      ts.SignatureKind.Construct,
+    );
+    if (constructorSignatures.length === 0) {
+      throw new Error(
+        "No constructor signatures found for " + node.expression.getText(),
+      );
+    }
+    for (const signature of constructorSignatures) {
+      const returnType = checker.getReturnTypeOfSignature(signature);
+      const result = getInternalTypeName(returnType, checker);
+      if (result) return result;
+    }
+    return undefined;
+  })();
+  switch (internalTypeName) {
+    case "Array":
+      return (() => {
+        if (!node.arguments || node.arguments.length === 0) {
+          return "[]";
+        }
+        const args = node.arguments.map((x) => checker.getTypeAtLocation(x));
+        console.log({
+          length: args.length,
+          types: args.map((arg) => arg.getSymbol()?.getName()),
+        });
+        if (args.length === 1) {
+          if (isNumber(args[0]))
+            return "array_fill(0, " + node.arguments[0].getText() + ", null)";
+          return `[${compileNode(node.arguments[0], checker, scope, new Indentation())}]`;
+        }
+        if (args.every((arg) => isNumber(arg)))
+          return (
+            "[" + node.arguments.map((arg) => arg.getText()).join(", ") + "]"
+          );
+        throw new Error("Unsupported array constructor arguments");
+      })();
+  }
+  const expression = compileNode(node.expression, checker, scope, indentation);
+  const args = node.arguments
+    ?.map((arg) => compileNode(arg, checker, scope, indentation))
+    .join(", ");
+  return `new ${expression}(${args ?? ""})`;
+};
+
 const compileCallExpressionNode = (
   node: ts.CallExpression,
   checker: ts.TypeChecker,
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
+  const internalMethodSpec = ts.isPropertyAccessExpression(node.expression)
+    ? getInternalTypePropertySpec(node.expression, checker)
+    : undefined;
+  if (internalMethodSpec) {
+    let specificResult = undefined;
+    switch (internalMethodSpec.internalTypeName) {
+      case "String":
+        specificResult = (() => {
+          return undefined;
+        })();
+        break;
+      case "Array":
+        specificResult = (() => {
+          return undefined;
+        })();
+        break;
+      case "RegExp":
+        specificResult = (() => {
+          return undefined;
+        })();
+        break;
+    }
+    if (specificResult) return specificResult;
+  }
   const expression = compileNode(node.expression, checker, scope, indentation);
   const args = node.arguments
     .map((arg) => compileNode(arg, checker, scope, indentation))
@@ -268,6 +349,30 @@ const compilePropertyAccessExpressionNode = (
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
+  const internalMethodSpec = getInternalTypePropertySpec(node, checker);
+  if (internalMethodSpec) {
+    let specificResult = undefined;
+    switch (internalMethodSpec.internalTypeName) {
+      case "String":
+        specificResult = (() => {
+          return undefined;
+        })();
+        break;
+      case "Array":
+        specificResult = (() => {
+          if (internalMethodSpec.methodName === "length")
+            return `count(${compileNode(node.expression, checker, scope, new Indentation())})`;
+          return undefined;
+        })();
+        break;
+      case "RegExp":
+        specificResult = (() => {
+          return undefined;
+        })();
+        break;
+    }
+    if (specificResult) return specificResult;
+  }
   const expression = compileNodeEnsureParentheses(
     node.expression,
     checker,
@@ -342,6 +447,7 @@ const compileImportDeclarationNode = (
     return "";
   }
   if (node.importClause) {
+    const importLines = [];
     if (
       node.importClause.namedBindings &&
       ts.isNamedImports(node.importClause.namedBindings)
@@ -355,10 +461,15 @@ const compileImportDeclarationNode = (
           return `${indentation.indentation}use function ${moduleSpecifier}\\${propertyName}${alias};`;
         }
       });
-      return imports.filter((i) => i !== undefined).join("\n");
+      importLines.push(...imports.filter((i) => i !== undefined));
     }
     if (node.importClause.name) {
-      return `${indentation.indentation}use ${moduleSpecifier}\\${node.importClause.name.text};`;
+      importLines.push(
+        `${indentation.indentation}use ${moduleSpecifier} as ${node.importClause.name.text};`,
+      );
+    }
+    if (importLines.length > 0) {
+      return importLines.join("\n");
     }
   }
   return `${indentation.indentation}use ${moduleSpecifier};`;
@@ -424,11 +535,14 @@ const compileNode = (
   if (ts.isParameter(node)) {
     return compileParameterNode(node, checker, scope);
   }
+  if (ts.isNewExpression(node)) {
+    return compileNewExpressionNode(node, checker, scope, indentation);
+  }
   if (ts.isCallExpression(node)) {
     return compileCallExpressionNode(node, checker, scope, indentation);
   }
   if (ts.isNoSubstitutionTemplateLiteral(node)) {
-    return JSON.stringify(
+    return prepareStringValue(
       node.getText().substring(1, node.getText().length - 1),
     );
   }

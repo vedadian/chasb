@@ -62,12 +62,12 @@ const compileVariableDeclarationNode = (
   const name =
     (isConstructible(node.name, checker) ? "" : "$") +
     prepareVariableName(node.name.getText());
-  if (symbol && name) {
-    scope.set(symbol, name);
-  }
   const initializer =
     node.initializer &&
     compileNode(node.initializer, checker, scope, indentation);
+  if (symbol && name) {
+    scope.set(symbol, name);
+  }
   if (!initializer || !name) return "";
   return `${name} = (${initializer})`;
 };
@@ -78,11 +78,15 @@ const compileParameterNode = (
   scope: Map<ts.Symbol, string>,
 ): string => {
   const symbol = checker.getSymbolAtLocation(node.name);
-  const name = prepareVariableName(node.name.getText());
-  if (symbol && name) {
-    scope.set(symbol, name);
+  if (!ts.isIdentifier(node.name)) {
+    throw new Error("Parameter name must be an identifier.");
   }
-  return name ? `$${name}` : "";
+  const name = prepareVariableName(node.name.getText());
+  const phpName = name && `$${name}`;
+  if (symbol && phpName) {
+    scope.set(symbol, phpName);
+  }
+  return name ? `${phpName}` : "";
 };
 
 const compileVariableDeclarationListNode = (
@@ -206,9 +210,20 @@ const compileFunctionNode = (
       `${indentation.indentation}}`,
     ].join("\n");
   })();
-  return `${
+  let prefix = "";
+  if (name !== undefined) {
+    const symbol = checker.getSymbolAtLocation(node.name!);
+    const phpName = `$${name}`;
+    if (symbol) {
+      scope.set(symbol, phpName);
+    }
+    if (node.kind === ts.SyntaxKind.FunctionDeclaration && name) {
+      prefix = `${phpName} = `;
+    }
+  }
+  return `${prefix}${
     async ? (generator ? "/* async* */ " : "/* async */ ") : ""
-  }${generator ? "*" : ""}function ${name ?? ""}(${parameters.join(", ")}) ${useExpression}${bodyConsideringAsync}`;
+  }${generator ? "*" : ""}function (${parameters.join(", ")}) ${useExpression}${bodyConsideringAsync}`;
 };
 
 const compileNewExpressionNode = (
@@ -295,7 +310,14 @@ const compileCallExpressionNode = (
     }
     if (specificResult) return specificResult;
   }
-  const expression = compileNode(node.expression, checker, scope, indentation);
+  const expressionSymbol = checker.getSymbolAtLocation(node.expression);
+  if (expressionSymbol && scope.has(expressionSymbol)) {
+    console.log({ expressionSymbol: expressionSymbol.getName() });
+  }
+  const expression =
+    expressionSymbol && scope.has(expressionSymbol)
+      ? scope.get(expressionSymbol)
+      : compileNode(node.expression, checker, scope, indentation);
   const args = node.arguments
     .map((arg) => compileNode(arg, checker, scope, indentation))
     .join(", ");

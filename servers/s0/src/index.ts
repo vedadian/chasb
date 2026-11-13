@@ -4,6 +4,7 @@ const createArray1 = () => new Array("Hello");
 const createArray2 = () => new Array(1, 2, 3, 4);
 
 async function doit() {
+  doit();
   const d = 12;
   const m = await readTextFile(`somefile.txt`);
   const n = await readTextFile(`file${d}.txt`);

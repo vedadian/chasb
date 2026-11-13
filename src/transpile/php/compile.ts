@@ -109,13 +109,19 @@ const compileVariableStatementNode = (
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
+  const isExported = node.modifiers?.some(
+    (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+  );
+  if (isExported && !(node.declarationList.flags & ts.NodeFlags.Const)) {
+    throw new Error("Exported variable statements must be const.");
+  }
   const declarationList = compileVariableDeclarationListNode(
     node.declarationList,
     checker,
     scope,
     indentation,
   );
-  if (node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
+  if (isExported) {
     return `/* export */ ${declarationList}`;
   }
   return declarationList;
@@ -163,6 +169,18 @@ const compileFunctionNode = (
   const async = node.modifiers?.some(
     (m) => m.kind === ts.SyntaxKind.AsyncKeyword,
   );
+  let prefix = "";
+  if (name !== undefined) {
+    const symbol = checker.getSymbolAtLocation(node.name!);
+    const phpName = `$${name}`;
+    if (symbol) {
+      console.log({ name, phpName });
+      scope.set(symbol, phpName);
+    }
+    if (node.kind === ts.SyntaxKind.FunctionDeclaration && name) {
+      prefix = `${phpName} = `;
+    }
+  }
   const generator = node.asteriskToken !== undefined;
   const parameters = node.parameters.map((p) =>
     compileParameterNode(p, checker, localScope),
@@ -184,12 +202,26 @@ const compileFunctionNode = (
       ].join("\n");
     }
   })();
-  const usedSymbols =
-    node.body &&
-    checker
-      .getSymbolsInScope(node.body, ts.SymbolFlags.BlockScopedVariable)
-      ?.filter((s) => scope.has(s))
-      .map((s) => scope.get(s));
+  const usedSymbols = (() => {
+    if (!node.body) {
+      return [];
+    }
+    const parameterSymbols = new Set(
+      node.parameters
+        .map((p) => checker.getSymbolAtLocation(p.name))
+        .filter((s): s is ts.Symbol => s !== undefined),
+    );
+    const usedSymbols: string[] = [];
+    const findSymbols = (node: ts.Node) => {
+      const s = checker.getSymbolAtLocation(node);
+      if (s && !parameterSymbols.has(s) && scope.has(s)) {
+        usedSymbols.push(scope.get(s)!);
+      }
+      node.forEachChild(findSymbols);
+    };
+    findSymbols(node.body);
+    return usedSymbols;
+  })();
   const useExpression = usedSymbols?.length
     ? `use (${usedSymbols.join(", ")}) `
     : "";
@@ -210,20 +242,11 @@ const compileFunctionNode = (
       `${indentation.indentation}}`,
     ].join("\n");
   })();
-  let prefix = "";
-  if (name !== undefined) {
-    const symbol = checker.getSymbolAtLocation(node.name!);
-    const phpName = `$${name}`;
-    if (symbol) {
-      scope.set(symbol, phpName);
-    }
-    if (node.kind === ts.SyntaxKind.FunctionDeclaration && name) {
-      prefix = `${phpName} = `;
-    }
-  }
   return `${prefix}${
     async ? (generator ? "/* async* */ " : "/* async */ ") : ""
-  }${generator ? "*" : ""}function (${parameters.join(", ")}) ${useExpression}${bodyConsideringAsync}`;
+  }${generator ? "*" : ""}function (${parameters.join(", ")}) ${useExpression}${
+    bodyConsideringAsync
+  }`;
 };
 
 const compileNewExpressionNode = (
@@ -257,10 +280,6 @@ const compileNewExpressionNode = (
           return "[]";
         }
         const args = node.arguments.map((x) => checker.getTypeAtLocation(x));
-        console.log({
-          length: args.length,
-          types: args.map((arg) => arg.getSymbol()?.getName()),
-        });
         if (args.length === 1) {
           if (isNumber(args[0]))
             return "array_fill(0, " + node.arguments[0].getText() + ", null)";
@@ -310,10 +329,8 @@ const compileCallExpressionNode = (
     }
     if (specificResult) return specificResult;
   }
+  console.log({ expression: node.expression.getText() });
   const expressionSymbol = checker.getSymbolAtLocation(node.expression);
-  if (expressionSymbol && scope.has(expressionSymbol)) {
-    console.log({ expressionSymbol: expressionSymbol.getName() });
-  }
   const expression =
     expressionSymbol && scope.has(expressionSymbol)
       ? scope.get(expressionSymbol)

@@ -124,7 +124,7 @@ export const validateModuleImports = (
     const moduleSpecifier = importStatement.moduleSpecifier;
     if (ts.isStringLiteral(moduleSpecifier)) {
       const importPath = moduleSpecifier.text;
-      if (!allowedImports.includes(importPath)) {
+      if (importPath[0] !== "." && !allowedImports.includes(importPath)) {
         const { line, character: column } =
           sourceFile.getLineAndCharacterOfPosition(importStatement.getStart());
         diagnostics.push({

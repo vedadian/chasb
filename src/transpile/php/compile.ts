@@ -1,13 +1,17 @@
 import ts from "typescript";
 import {
+  checkDescendants,
   getInternalTypeName,
   getInternalTypePropertySpec,
   Indentation,
   isConstructible,
   isNumber,
+  isObjectLiteral,
   isStringLike,
+  populateVariableInfo,
   prepareStringValue,
   prepareVariableName,
+  updateScope,
 } from "./helper.js";
 
 const compileNodeEnsureParentheses = (
@@ -17,7 +21,9 @@ const compileNodeEnsureParentheses = (
   indentation: Indentation,
 ): string => {
   const code = compileNode(node, checker, scope, indentation);
-  return ts.isIdentifier(node) || ts.isParenthesizedExpression(node)
+  return ts.isLiteralExpression(node) ||
+    ts.isIdentifier(node) ||
+    ts.isParenthesizedExpression(node)
     ? code
     : `(${code})`;
 };
@@ -57,19 +63,62 @@ const compileVariableDeclarationNode = (
   checker: ts.TypeChecker,
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
-): string => {
-  const symbol = checker.getSymbolAtLocation(node.name);
-  const name =
-    (isConstructible(node.name, checker) ? "" : "$") +
-    prepareVariableName(node.name.getText());
+) => {
+  const getOmittedExpressionVarName = (() => {
+    const scopedVariableNames = new Set(scope.values());
+    let omittedExpressionIndex = 0;
+
+    return () => {
+      let result = `$___${omittedExpressionIndex}`;
+      while (scopedVariableNames.has(result)) {
+        omittedExpressionIndex++;
+        result = `$___${omittedExpressionIndex}`;
+      }
+      return result;
+    };
+  })();
+
+  const traverseName = (
+    name: ts.BindingName,
+    propertyName?: string,
+  ): string => {
+    if (ts.isIdentifier(name)) {
+      const rawResult = populateVariableInfo(name, checker);
+      if (!rawResult)
+        return `${getOmittedExpressionVarName()} /* !UNEXPECTED! */`;
+      const [result, symbol, constructible] = rawResult;
+      const variableName = constructible
+        ? prepareVariableName(result)
+        : `$${prepareVariableName(result)}`;
+      scope.set(symbol, variableName);
+      if (propertyName)
+        return `${prepareStringValue(propertyName)} => ${variableName}`;
+      return variableName;
+    }
+    const elements = name.elements
+      .map((e) =>
+        ts.isOmittedExpression(e)
+          ? getOmittedExpressionVarName()
+          : traverseName(
+              e.name,
+              ts.isObjectBindingPattern(name)
+                ? (e.propertyName?.getText() ?? e.name.getText())
+                : undefined,
+            ),
+      )
+      .join(", ");
+    const result = `[ ${elements} ]`;
+    return propertyName
+      ? `${prepareStringValue(propertyName)} => ${result}`
+      : result;
+  };
+
+  let expression = traverseName(node.name);
   const initializer =
     node.initializer &&
-    compileNode(node.initializer, checker, scope, indentation);
-  if (symbol && name) {
-    scope.set(symbol, name);
-  }
-  if (!initializer || !name) return "";
-  return `${name} = (${initializer})`;
+    compileNodeEnsureParentheses(node.initializer, checker, scope, indentation);
+  if (!initializer || expression === "") return "";
+  return `${expression} = ${initializer}`;
 };
 
 const compileParameterNode = (
@@ -174,7 +223,6 @@ const compileFunctionNode = (
     const symbol = checker.getSymbolAtLocation(node.name!);
     const phpName = `$${name}`;
     if (symbol) {
-      console.log({ name, phpName });
       scope.set(symbol, phpName);
     }
     if (node.kind === ts.SyntaxKind.FunctionDeclaration && name) {
@@ -329,7 +377,6 @@ const compileCallExpressionNode = (
     }
     if (specificResult) return specificResult;
   }
-  console.log({ expression: node.expression.getText() });
   const expressionSymbol = checker.getSymbolAtLocation(node.expression);
   const expression =
     expressionSymbol && scope.has(expressionSymbol)
@@ -362,12 +409,10 @@ const compileBinaryExpressionNode = (
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
-  const left = compileNodeEnsureParentheses(
-    node.left,
-    checker,
-    scope,
-    indentation,
-  );
+  const left =
+    node.operatorToken.kind == ts.SyntaxKind.EqualsToken
+      ? compileNode(node.left, checker, scope, indentation)
+      : compileNodeEnsureParentheses(node.left, checker, scope, indentation);
   const right = compileNodeEnsureParentheses(
     node.right,
     checker,
@@ -412,21 +457,16 @@ const compilePropertyAccessExpressionNode = (
     }
     if (specificResult) return specificResult;
   }
-  const expression = compileNodeEnsureParentheses(
-    node.expression,
-    checker,
-    scope,
-    indentation,
-  );
-  const name = node.name.getText();
-  return (
-    indentation.indentation +
-    [
-      expression,
-      isConstructible(node.expression, checker) ? "::" : "->",
-      name,
-    ].join("")
-  );
+  const expression = compileNode(node.expression, checker, scope, indentation);
+  let name = node.name.getText();
+  let operator = "->";
+  if (isConstructible(node.expression, checker)) {
+    operator = "::";
+  } else if (isObjectLiteral(checker.getTypeAtLocation(node.expression))) {
+    name = `[${prepareStringValue(name)}]`;
+    operator = "";
+  }
+  return indentation.indentation + [expression, operator, name].join("");
 };
 
 const compilePropertyAssignmentNode = (
@@ -476,42 +516,101 @@ const compileImportDeclarationNode = (
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
+  if (!node.importClause) return "";
   const moduleSpecifier =
     ts.isStringLiteral(node.moduleSpecifier) &&
-    node.moduleSpecifier.text.replace(/\//g, "\\");
+    node.moduleSpecifier.text
+      .replace(/\//g, "\\")
+      .split("\\")
+      .map((name) => `${name[0].toUpperCase()}${name.slice(1)}`);
   if (!moduleSpecifier) {
     return "";
   }
-  if (moduleSpecifier.startsWith(".")) {
-    return "";
+  if (moduleSpecifier[0] === ".") {
+    moduleSpecifier[0] = "Chasb";
+    moduleSpecifier.splice(1, 0, "Backend");
+  } else {
+    moduleSpecifier.splice(1, 0, "Bootstrap");
   }
-  if (node.importClause) {
-    const importLines = [];
-    if (
-      node.importClause.namedBindings &&
-      ts.isNamedImports(node.importClause.namedBindings)
-    ) {
-      const imports = node.importClause.namedBindings.elements.map((n) => {
+
+  let name = node.importClause.name?.text;
+  let namedBindings: Array<{ name: string; alias?: string }> | undefined =
+    undefined;
+
+  if (name && node.importClause.name) {
+    updateScope(node.importClause.name, checker, scope, name);
+  }
+
+  if (
+    node.importClause.namedBindings &&
+    ts.isNamedImports(node.importClause.namedBindings)
+  ) {
+    namedBindings = node.importClause.namedBindings.elements
+      .map((n) => {
         if (!ts.isImportSpecifier(n)) return undefined;
-        const propertyName = n.propertyName ? n.propertyName.text : n.name.text;
-        const alias = n.propertyName ? ` as ${n.name.text}` : "";
-        const nodeType = checker.getTypeAtLocation(n);
-        if (nodeType.getCallSignatures().length > 0) {
-          return `${indentation.indentation}use function ${moduleSpecifier}\\${propertyName}${alias};`;
-        }
-      });
-      importLines.push(...imports.filter((i) => i !== undefined));
-    }
-    if (node.importClause.name) {
-      importLines.push(
-        `${indentation.indentation}use ${moduleSpecifier} as ${node.importClause.name.text};`,
-      );
-    }
-    if (importLines.length > 0) {
-      return importLines.join("\n");
-    }
+        const name = n.propertyName ? n.propertyName.text : n.name.text;
+        const alias = n.propertyName?.text;
+        return { name, alias };
+      })
+      .filter((e) => e !== undefined);
   }
-  return `${indentation.indentation}use ${moduleSpecifier};`;
+  let destructure: string = "";
+  let namedBindingsDestructure: string = "";
+  let imports: string = "";
+  let namedBindingsImports: string = "";
+
+  const buildDestructureItem = (name: string | number, alias?: string) => {
+    return alias
+      ? `${alias ? prepareStringValue(alias) : name} => $${prepareVariableName(alias)}`
+      : `$${prepareVariableName(name as string)}`;
+  };
+  const buildImportItem = (name: string | number, alias?: string) => {
+    return alias
+      ? `${typeof name === "number" ? name : prepareStringValue(name)} => ${prepareStringValue(alias)}`
+      : `${prepareStringValue(name as string)}`;
+  };
+  if (namedBindings) {
+    const hasBindingsWithAlias = namedBindings?.some(
+      (n) => n.alias !== undefined,
+    );
+    let nonAliasedBindingIndex = 0;
+    nonAliasedBindingIndex = 0;
+    namedBindingsDestructure = `[${namedBindings
+      .map((n) =>
+        hasBindingsWithAlias
+          ? buildDestructureItem(
+              n.alias ? n.alias : nonAliasedBindingIndex++,
+              n.alias ?? n.name,
+            )
+          : buildDestructureItem(0, n.name),
+      )
+      .join(", ")}]`;
+    nonAliasedBindingIndex = 0;
+    namedBindingsImports = `[${namedBindings
+      .map((n) =>
+        hasBindingsWithAlias
+          ? buildImportItem(
+              n.alias ? n.name : nonAliasedBindingIndex++,
+              n.alias ?? n.name,
+            )
+          : buildImportItem(n.name),
+      )
+      .join(", ")}]`;
+  }
+  if (name) {
+    if (namedBindings) {
+      destructure = `[${buildDestructureItem(name)}, ${namedBindingsDestructure}]`;
+      imports = `[${buildImportItem(name)}, ${namedBindingsImports}]`;
+    } else {
+      destructure = buildDestructureItem(name);
+      imports = "";
+    }
+  } else if (namedBindings) {
+    destructure = namedBindingsDestructure;
+    imports = namedBindingsImports;
+  }
+  if (imports !== "") imports = `, ${imports}`;
+  return `${destructure} = Module::import(${moduleSpecifier.join("\\")}::class${imports});`;
 };
 
 const compileNode = (
@@ -520,6 +619,9 @@ const compileNode = (
   scope: Map<ts.Symbol, string>,
   indentation: Indentation,
 ): string => {
+  if (ts.isInterfaceDeclaration(node)) {
+    return "";
+  }
   if (ts.isImportDeclaration(node)) {
     return compileImportDeclarationNode(node, checker, scope, indentation);
   }
@@ -620,9 +722,13 @@ export const compileToPhp = (
   source: ts.SourceFile,
   checker: ts.TypeChecker,
 ) => {
+  const usesAsync = checkDescendants(
+    source,
+    (n) => n.kind === ts.SyntaxKind.AsyncKeyword,
+  );
   const scope = new Map<ts.Symbol, string>();
   const parts = [
-    "use function Amp\\async;",
+    ...(usesAsync ? ["use function Amp\\async;"] : []),
     ...source.statements.map((n) =>
       compileNode(n, checker, scope, new Indentation()),
     ),

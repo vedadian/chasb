@@ -1,3 +1,4 @@
+import path from "node:path";
 import cac from "cac";
 
 import { compileToPhp } from "./php/compile.js";
@@ -5,6 +6,9 @@ import { getTypescriptProgram } from "./project.js";
 import { validateTypescriptProgram } from "./validate.js";
 
 const cli = cac();
+
+const prepareName = (fileName: string) =>
+  `${fileName[0].toUpperCase()}${fileName.slice(1)}`;
 
 cli
   .command("php <projectPath>", "Transpile a typescript program")
@@ -25,11 +29,17 @@ cli
       process.exit(1);
     }
     if (program) {
-      const phpCode = compileToPhp(
-        program.getSourceFile(program.getRootFileNames()[0])!,
-        program.getTypeChecker(),
-      );
-      console.log(phpCode);
+      console.log("\n\n");
+      for (const sourceFile of program.getSourceFiles()) {
+        if (sourceFile.isDeclarationFile) {
+          continue;
+        }
+        console.log(
+          `================ src/Backend/${prepareName(path.parse(sourceFile.fileName).name)}/Module.php ================`,
+        );
+        const phpCode = compileToPhp(sourceFile, program.getTypeChecker());
+        console.log(phpCode);
+      }
     }
   });
 

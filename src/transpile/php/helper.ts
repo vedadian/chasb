@@ -1,4 +1,4 @@
-import ts from "typescript";
+import ts, { EnumType } from "typescript";
 
 export class Indentation {
   private level: number = 0;
@@ -47,9 +47,9 @@ export const isRegExp = (type: ts.Type): boolean => {
 };
 
 export const isObjectLiteral = (type: ts.Type): boolean =>
-  Boolean(
-    type.flags & ts.TypeFlags.Object &&
-    !((type as ts.ObjectType).objectFlags & ts.ObjectFlags.Class),
+  Boolean(type.flags & ts.TypeFlags.Object) &&
+  !Boolean(
+    (type as ts.ObjectType).objectFlags & ts.ObjectFlags.ClassOrInterface,
   );
 
 export const getInternalTypeName = (type: ts.Type, checker: ts.TypeChecker) => {
@@ -97,10 +97,15 @@ export const populateVariableInfo = (
   return [name, symbol, constructible] as const;
 };
 
+export type ScopeSymbolInfo = {
+  name: string;
+  referenced: boolean;
+};
+
 export const updateScope = (
   node: ts.Node,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   name?: string,
 ) => {
   const rawResult = populateVariableInfo(node, checker, name);
@@ -109,6 +114,19 @@ export const updateScope = (
   const variableName = constructible
     ? prepareVariableName(nameResult)
     : `$${prepareVariableName(nameResult)}`;
-  scope.set(symbol, variableName);
+  scope.set(symbol, { name: variableName, referenced: false });
   return variableName;
+};
+
+export const debugFlags = <T extends Record<string, string | number>>(
+  flags: number,
+  reference: T,
+) => {
+  for (const [name, value] of Object.entries(reference)) {
+    if (typeof value !== "number") continue;
+
+    if ((flags & value) !== 0) {
+      console.log(`${name}(${value})`);
+    }
+  }
 };

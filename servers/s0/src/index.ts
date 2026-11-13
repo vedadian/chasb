@@ -6,6 +6,8 @@ const [a, , b] = [1, 2, 3];
 const { a: d, b: e } = { a: 12, b: 14 };
 const { f, g } = { f: 12, g: 14 };
 
+console.log(d, e);
+
 interface AAAI {
   f: number;
   g: number;
@@ -16,7 +18,8 @@ AAA.f = 15;
 
 async function doit() {
   doit();
-  const d = 12;
+  const f = (n: number): number => (n === 0 ? 1 : n * f(n - 1));
+  const d = f(4);
   const m = await readTextFile(`somefile.txt`);
   const n = await readTextFile(`file${d}.txt`);
   const p = {

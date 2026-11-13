@@ -1,3 +1,4 @@
+import path from "node:path";
 import ts from "typescript";
 import {
   checkDescendants,
@@ -12,12 +13,13 @@ import {
   prepareStringValue,
   prepareVariableName,
   updateScope,
+  type ScopeSymbolInfo,
 } from "./helper.js";
 
 const compileNodeEnsureParentheses = (
   node: ts.Node,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const code = compileNode(node, checker, scope, indentation);
@@ -31,10 +33,10 @@ const compileNodeEnsureParentheses = (
 const compileIdentifierNode = (
   node: ts.Identifier,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
 ): string => {
   const symbol = checker.getSymbolAtLocation(node);
-  const variableName = symbol && scope.get(symbol);
+  const variableName = symbol && scope.get(symbol)?.name;
   return variableName ? `${variableName}` : node.text;
 };
 
@@ -45,7 +47,7 @@ const compileStringLiteralNode = (
 const compileTemplateExpressionNode = (
   node: ts.TemplateExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   return [
@@ -61,11 +63,14 @@ const compileTemplateExpressionNode = (
 const compileVariableDeclarationNode = (
   node: ts.VariableDeclaration,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
+  exported: boolean = false,
 ) => {
   const getOmittedExpressionVarName = (() => {
-    const scopedVariableNames = new Set(scope.values());
+    const scopedVariableNames = new Set(
+      Array.from(scope.values()).map((v) => v.name),
+    );
     let omittedExpressionIndex = 0;
 
     return () => {
@@ -90,7 +95,7 @@ const compileVariableDeclarationNode = (
       const variableName = constructible
         ? prepareVariableName(result)
         : `$${prepareVariableName(result)}`;
-      scope.set(symbol, variableName);
+      scope.set(symbol, { name: variableName, referenced: false });
       if (propertyName)
         return `${prepareStringValue(propertyName)} => ${variableName}`;
       return variableName;
@@ -113,18 +118,25 @@ const compileVariableDeclarationNode = (
       : result;
   };
 
+  let exportedName = "";
+  if (exported) {
+    if (!ts.isIdentifier(node.name)) {
+      throw new Error("Exported variable must have an identifier name.");
+    }
+    exportedName = node.name.text;
+  }
   let expression = traverseName(node.name);
   const initializer =
     node.initializer &&
-    compileNodeEnsureParentheses(node.initializer, checker, scope, indentation);
+    compileNode(node.initializer, checker, scope, indentation);
   if (!initializer || expression === "") return "";
-  return `${expression} = ${initializer}`;
+  return `${exported ? `$exports[${prepareStringValue(exportedName)}] = ` : ""}${expression} = ${initializer}`;
 };
 
 const compileParameterNode = (
   node: ts.ParameterDeclaration,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
 ): string => {
   const symbol = checker.getSymbolAtLocation(node.name);
   if (!ts.isIdentifier(node.name)) {
@@ -133,7 +145,7 @@ const compileParameterNode = (
   const name = prepareVariableName(node.name.getText());
   const phpName = name && `$${name}`;
   if (symbol && phpName) {
-    scope.set(symbol, phpName);
+    scope.set(symbol, { name: phpName, referenced: false });
   }
   return name ? `${phpName}` : "";
 };
@@ -141,12 +153,19 @@ const compileParameterNode = (
 const compileVariableDeclarationListNode = (
   node: ts.VariableDeclarationList,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
+  exported: boolean = false,
 ): string => {
   return node.declarations
     .map((decl) =>
-      compileVariableDeclarationNode(decl, checker, scope, indentation),
+      compileVariableDeclarationNode(
+        decl,
+        checker,
+        scope,
+        indentation,
+        exported,
+      ),
     )
     .map((line) => `${indentation.indentation}${line};`)
     .join("\n");
@@ -155,7 +174,7 @@ const compileVariableDeclarationListNode = (
 const compileVariableStatementNode = (
   node: ts.VariableStatement,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const isExported = node.modifiers?.some(
@@ -169,27 +188,37 @@ const compileVariableStatementNode = (
     checker,
     scope,
     indentation,
+    isExported,
   );
-  if (isExported) {
-    return `/* export */ ${declarationList}`;
-  }
   return declarationList;
 };
 
 const compileBlockNode = (
   node: ts.Block,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
-  const localScope = new Map(scope);
+  const localScope = new Map(
+    Array.from(scope.entries()).map(([key, value]) => [
+      key,
+      { ...value, referenced: false },
+    ]),
+  );
   indentation.increase();
+  const statementIndentation = indentation.indentation;
   const statements = node.statements.map((n) =>
     compileNode(n, checker, localScope, indentation),
   );
   indentation.decrease();
+  const referencedSymbols = Array.from(localScope.values()).filter(
+    (info) => info.referenced,
+  );
   return [
     `${indentation.indentation}{`,
+    ...referencedSymbols.map(
+      (info) => `${statementIndentation}${info.name} = null;`,
+    ),
     ...statements,
     `${indentation.indentation}}`,
   ].join("\n");
@@ -198,7 +227,7 @@ const compileBlockNode = (
 const compileReturnNode = (
   node: ts.ReturnStatement,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const expression = node.expression
@@ -210,10 +239,15 @@ const compileReturnNode = (
 const compileFunctionNode = (
   node: ts.FunctionLikeDeclaration | ts.ArrowFunction | ts.FunctionExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
-  const localScope = new Map(scope);
+  const localScope = new Map(
+    Array.from(scope.entries()).map(([key, value]) => [
+      key,
+      { ...value, referenced: false },
+    ]),
+  );
   const name = prepareVariableName(node.name?.getText());
   const async = node.modifiers?.some(
     (m) => m.kind === ts.SyntaxKind.AsyncKeyword,
@@ -223,13 +257,13 @@ const compileFunctionNode = (
     const symbol = checker.getSymbolAtLocation(node.name!);
     const phpName = `$${name}`;
     if (symbol) {
-      scope.set(symbol, phpName);
+      scope.set(symbol, { name: phpName, referenced: false });
+      localScope.set(symbol, { name: phpName, referenced: false });
     }
     if (node.kind === ts.SyntaxKind.FunctionDeclaration && name) {
       prefix = `${phpName} = `;
     }
   }
-  const generator = node.asteriskToken !== undefined;
   const parameters = node.parameters.map((p) =>
     compileParameterNode(p, checker, localScope),
   );
@@ -251,6 +285,15 @@ const compileFunctionNode = (
     }
   })();
   const usedSymbols = (() => {
+    const selfSymbols = new Set();
+    if (ts.isVariableDeclaration(node.parent)) {
+      const symbol = checker.getSymbolAtLocation(node.parent.name);
+      if (symbol) selfSymbols.add(symbol);
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      const symbol = checker.getSymbolAtLocation(node.name);
+      if (symbol) selfSymbols.add(symbol);
+    }
     if (!node.body) {
       return [];
     }
@@ -259,16 +302,20 @@ const compileFunctionNode = (
         .map((p) => checker.getSymbolAtLocation(p.name))
         .filter((s): s is ts.Symbol => s !== undefined),
     );
-    const usedSymbols: string[] = [];
+    const usedSymbols = new Set<string>();
     const findSymbols = (node: ts.Node) => {
       const s = checker.getSymbolAtLocation(node);
       if (s && !parameterSymbols.has(s) && scope.has(s)) {
-        usedSymbols.push(scope.get(s)!);
+        const info = scope.get(s)!;
+        if (selfSymbols.has(s)) {
+          usedSymbols.add(`&${info.name}`);
+          info.referenced = true;
+        } else usedSymbols.add(info.name);
       }
       node.forEachChild(findSymbols);
     };
     findSymbols(node.body);
-    return usedSymbols;
+    return Array.from(usedSymbols);
   })();
   const useExpression = usedSymbols?.length
     ? `use (${usedSymbols.join(", ")}) `
@@ -290,17 +337,15 @@ const compileFunctionNode = (
       `${indentation.indentation}}`,
     ].join("\n");
   })();
-  return `${prefix}${
-    async ? (generator ? "/* async* */ " : "/* async */ ") : ""
-  }${generator ? "*" : ""}function (${parameters.join(", ")}) ${useExpression}${
+  return `${prefix}function (${parameters.join(", ")}) ${useExpression}${
     bodyConsideringAsync
-  }`;
+  }${ts.isFunctionDeclaration(node) ? ";" : ""}`;
 };
 
 const compileNewExpressionNode = (
   node: ts.NewExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const internalTypeName = (() => {
@@ -344,13 +389,13 @@ const compileNewExpressionNode = (
   const args = node.arguments
     ?.map((arg) => compileNode(arg, checker, scope, indentation))
     .join(", ");
-  return `new ${expression}(${args ?? ""})`;
+  return `(new ${expression}(${args ?? ""}))`;
 };
 
 const compileCallExpressionNode = (
   node: ts.CallExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const internalMethodSpec = ts.isPropertyAccessExpression(node.expression)
@@ -380,18 +425,18 @@ const compileCallExpressionNode = (
   const expressionSymbol = checker.getSymbolAtLocation(node.expression);
   const expression =
     expressionSymbol && scope.has(expressionSymbol)
-      ? scope.get(expressionSymbol)
+      ? scope.get(expressionSymbol)!.name
       : compileNode(node.expression, checker, scope, indentation);
   const args = node.arguments
     .map((arg) => compileNode(arg, checker, scope, indentation))
     .join(", ");
-  return `${expression}(${args})`;
+  return `${indentation.indentation}${expression}(${args})`;
 };
 
 const compileAwaitExpressionNode = (
   node: ts.AwaitExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const expression = compileNodeEnsureParentheses(
@@ -406,19 +451,17 @@ const compileAwaitExpressionNode = (
 const compileBinaryExpressionNode = (
   node: ts.BinaryExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const left =
     node.operatorToken.kind == ts.SyntaxKind.EqualsToken
       ? compileNode(node.left, checker, scope, indentation)
       : compileNodeEnsureParentheses(node.left, checker, scope, indentation);
-  const right = compileNodeEnsureParentheses(
-    node.right,
-    checker,
-    scope,
-    indentation,
-  );
+  const right =
+    node.operatorToken.kind == ts.SyntaxKind.EqualsToken
+      ? compileNode(node.right, checker, scope, indentation)
+      : compileNodeEnsureParentheses(node.right, checker, scope, indentation);
   const operator =
     node.operatorToken.kind === ts.SyntaxKind.PlusToken &&
     (isStringLike(node.left, checker) || isStringLike(node.right, checker))
@@ -430,7 +473,7 @@ const compileBinaryExpressionNode = (
 const compilePropertyAccessExpressionNode = (
   node: ts.PropertyAccessExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   const internalMethodSpec = getInternalTypePropertySpec(node, checker);
@@ -472,7 +515,7 @@ const compilePropertyAccessExpressionNode = (
 const compilePropertyAssignmentNode = (
   node: ts.PropertyAssignment,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
 ): string => {
   const name = ts.isIdentifier(node.name)
     ? JSON.stringify(node.name.text)
@@ -496,7 +539,7 @@ const compilePropertyAssignmentNode = (
 const compileObjectLiteralExpressionNode = (
   node: ts.ObjectLiteralExpression,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   indentation.increase();
@@ -507,13 +550,24 @@ const compileObjectLiteralExpressionNode = (
     )
     .join(",\n");
   indentation.decrease();
-  return `[\n${properties}\n${indentation.indentation}]`;
+  const nodeType = checker.getTypeAtLocation(node.parent);
+  const nodeObjectType =
+    nodeType.flags & ts.TypeFlags.Object ? (nodeType as ts.ObjectType) : null;
+  const isPhpObject =
+    Boolean(nodeType.flags & ts.TypeFlags.Object) &&
+    !Boolean(nodeType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) &&
+    Boolean(
+      (nodeObjectType?.objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface,
+    );
+  return `${
+    isPhpObject ? "(object)" : ""
+  }[\n${properties}\n${indentation.indentation}]`;
 };
 
 const compileImportDeclarationNode = (
   node: ts.ImportDeclaration,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
   if (!node.importClause) return "";
@@ -537,8 +591,25 @@ const compileImportDeclarationNode = (
   let namedBindings: Array<{ name: string; alias?: string }> | undefined =
     undefined;
 
-  if (name && node.importClause.name) {
-    updateScope(node.importClause.name, checker, scope, name);
+  if (node.importClause.name) {
+    updateScope(node.importClause.name, checker, scope);
+  }
+  if (
+    node.importClause.namedBindings &&
+    ts.isNamedImports(node.importClause.namedBindings)
+  ) {
+    node.importClause.namedBindings.elements.forEach((binding) => {
+      if (binding.propertyName) {
+        updateScope(
+          binding.propertyName,
+          checker,
+          scope,
+          binding.propertyName.getText(),
+        );
+      } else {
+        updateScope(binding.name, checker, scope, binding.name.text);
+      }
+    });
   }
 
   if (
@@ -610,15 +681,18 @@ const compileImportDeclarationNode = (
     imports = namedBindingsImports;
   }
   if (imports !== "") imports = `, ${imports}`;
-  return `${destructure} = Module::import(${moduleSpecifier.join("\\")}::class${imports});`;
+  return `${destructure} = ModuleBase::import(\\${moduleSpecifier.join("\\")}\\Module::class${imports});`;
 };
 
 const compileNode = (
   node: ts.Node,
   checker: ts.TypeChecker,
-  scope: Map<ts.Symbol, string>,
+  scope: Map<ts.Symbol, ScopeSymbolInfo>,
   indentation: Indentation,
 ): string => {
+  if (ts.isExpressionStatement(node)) {
+    return `${compileNode(node.expression, checker, scope, indentation)};`;
+  }
   if (ts.isInterfaceDeclaration(node)) {
     return "";
   }
@@ -726,12 +800,35 @@ export const compileToPhp = (
     source,
     (n) => n.kind === ts.SyntaxKind.AsyncKeyword,
   );
-  const scope = new Map<ts.Symbol, string>();
-  const parts = [
-    ...(usesAsync ? ["use function Amp\\async;"] : []),
+  const scope = new Map<ts.Symbol, ScopeSymbolInfo>();
+  const transpiledLines = [
+    "$exports = [];",
     ...source.statements.map((n) =>
       compileNode(n, checker, scope, new Indentation()),
     ),
+    "return $exports;",
   ];
-  return parts.join("\n");
+  const moduleName = path.parse(source.fileName).name;
+  const singleIndent = new Indentation().increase().indentation;
+  const allLines = [
+    "<?php\n",
+    "declare(strict_types=1);\n\n",
+    `namespace Chasb\\Backend\\${moduleName[0].toUpperCase()}${moduleName.slice(1)};\n`,
+    "use \\Chasb\\Bootstrap\\Module as ModuleBase;",
+    ...(usesAsync ? ["use function \\Amp\\async;"] : []),
+    "",
+    "class Module extends ModuleBase {",
+    `${singleIndent}public function __construct()`,
+    `${singleIndent}{`,
+    ...Array.from(scope.values())
+      .filter((info) => info.referenced)
+      .map((info) => `${singleIndent}${singleIndent}${info.name} = null;`),
+    ...transpiledLines
+      .flatMap((line) => line.split("\n"))
+      .map((line) => `${singleIndent}${singleIndent}${line}`),
+    `${singleIndent}}`,
+    "}",
+    "",
+  ];
+  return allLines.join("\n");
 };
